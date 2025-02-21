@@ -1,0 +1,189 @@
+from pprint import pprint
+import requests
+from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer, util
+from transformers import pipeline
+
+
+class URLValidator:
+    """
+    A class to evaluate the credibility of a webpage using domain trust, content relevance,
+    fact-checking, bias detection, and citations, with SERP API integration for Google Scholar.
+    """
+
+    def __init__(self, serp_api_key: str):
+        self.serp_api_key = "your serp api"
+        self.similarity_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+        self.fake_news_classifier = pipeline(
+            "text-classification", model="mrm8488/bert-tiny-finetuned-fake-news-detection"
+        )
+        self.sentiment_analyzer = pipeline(
+            "text-classification", model="cardiffnlp/twitter-roberta-base-sentiment"
+        )
+
+    def fetch_page_content(self, url: str) -> str:
+        """Fetch and extract text content from the given URL."""
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            content = " ".join([p.text.strip() for p in soup.find_all("p") if p.text.strip()])
+            return content if content else ""
+        except requests.RequestException:
+            return ""
+
+    def get_domain_trust(self, url: str) -> int:
+        """Determine the trustworthiness of the domain."""
+        domain_scores = {
+            "highly_trusted": {
+                "mayoclinic.org": 95, "nih.gov": 95, "who.int": 95, "bbc.com": 85,
+                "reuters.com": 95, "harvard.edu": 95, "stanford.edu": 95,
+            },
+            "trusted": {
+                "nytimes.com": 85, "sciencedaily.com": 80, "wired.com": 80, "arxiv.org": 80,
+            },
+            "moderately_trusted": {
+                "wikipedia.org": 70, "medium.com": 60, "healthline.com": 65,
+            },
+            "low_trust": {
+                "reddit.com": 45, "quora.com": 40, "buzzfeednews.com": 45,
+            },
+            "very_low_trust": {
+                "infowars.com": 15, "breitbart.com": 20, "theonion.com": 15,
+            },
+        }
+
+        for trust_level, domains in domain_scores.items():
+            for domain, score in domains.items():
+                if domain in url:
+                    return score
+        return 35  # Default score for unknown domains
+
+    def compute_similarity_score(self, user_query: str, content: str) -> int:
+        """Compute semantic similarity between the user query and webpage content."""
+        if not content or not user_query.strip():
+            return 0
+        try:
+            content = content[:2000]
+            similarity = util.pytorch_cos_sim(
+                self.similarity_model.encode(user_query, normalize_embeddings=True),
+                self.similarity_model.encode(content, normalize_embeddings=True)
+            ).item()
+            return max(0, min(int(similarity * 100), 100))
+        except Exception as e:
+            print(f"Error in compute_similarity_score: {e}")
+            return 0
+
+    def check_facts(self, content: str) -> int:
+        """Check facts in the content using a fact-check API."""
+        if not content:
+            return 50
+        try:
+            api_url = f"https://toolbox.google.com/factcheck/api/v1/claimsearch?query={content[:200]}"
+            response = requests.get(api_url)
+            data = response.json()
+            return 90 if "claims" in data and data["claims"] else 40
+        except:
+            return 50
+
+    def check_google_scholar(self, query: str) -> int:
+        """Check Google Scholar for citations using SERP API."""
+        try:
+            serp_api_url = "https://serpapi.com/search.json"
+            params = {
+                "engine": "google_scholar",
+                "q": query,
+                "api_key": self.serp_api_key
+            }
+            response = requests.get(serp_api_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            if "organic_results" in data:
+                citation_counts = [
+                    int(result.get("cited_by", {}).get("value", 0))
+                    for result in data["organic_results"]
+                    if "cited_by" in result
+                ]
+                total_citations = sum(citation_counts)
+                return max(35, min(total_citations * 2, 100))
+            else:
+                return 35
+        except Exception as e:
+            print(f"Error fetching Google Scholar citations: {e}")
+            return 35
+
+    def detect_bias(self, content: str) -> int:
+        """Detect bias in the content using sentiment analysis."""
+        if not content:
+            return 50
+        sentiment_result = self.sentiment_analyzer(content[:512])[0]
+        label = sentiment_result["label"]
+        if label == "POSITIVE":
+            return 90
+        elif label == "NEGATIVE":
+            return 30
+        else:
+            return 60
+
+    def get_star_rating(self, score: float) -> tuple:
+        """Convert a score (0-100) into a 1-5 star rating."""
+        stars = max(1, min(5, round(score / 20)))
+        return stars, "⭐" * stars
+
+    def generate_explanation(self, domain_trust, similarity_score, fact_check_score, bias_score, citation_score) -> str:
+        """Generate an explanation for the score."""
+        reasons = []
+        if domain_trust < 50:
+            reasons.append("The source has low domain authority.")
+        if similarity_score < 50:
+            reasons.append("The content is not highly relevant to your query.")
+        if fact_check_score < 50:
+            reasons.append("Limited fact-checking verification found.")
+        if bias_score < 50:
+            reasons.append("Potential bias detected in the content.")
+        if citation_score < 50:
+            reasons.append("Few citations found for this content.")
+        return " ".join(reasons) if reasons else "This source is highly credible and relevant."
+
+    def rate_url_validity(self, user_query: str, url: str) -> dict:
+        """Evaluate the validity of a webpage."""
+        content = self.fetch_page_content(url)
+        domain_trust = self.get_domain_trust(url)
+        similarity_score = self.compute_similarity_score(user_query, content)
+        fact_check_score = self.check_facts(content)
+        bias_score = self.detect_bias(content)
+        citation_score = self.check_google_scholar(user_query)
+
+        final_score = (
+            (0.4 * domain_trust) +
+            (0.3 * similarity_score) +
+            (0.15 * fact_check_score) +
+            (0.1 * bias_score) +
+            (0.15 * citation_score)
+        )
+
+        stars, icon = self.get_star_rating(final_score)
+        explanation = self.generate_explanation(domain_trust, similarity_score, fact_check_score, bias_score, citation_score)
+
+        return {
+            "scores": {
+                "Domain Trust": domain_trust,
+                "Content Relevance": similarity_score,
+                "Fact-Check": fact_check_score,
+                "Bias": bias_score,
+                "Citations": citation_score,
+                "Final Score": final_score
+            },
+            "stars": {"rating": stars, "icon": icon},
+            "explanation": explanation
+        }
+
+
+if __name__ == "__main__":
+    serp_api_key = "your serp api"  # Replace with your SERP API key
+    validator = URLValidator(serp_api_key)
+    user_query = "Is russia and america are good friends?"
+    test_url = "https://www.nytimes.com/2025/02/18/world/europe/us-russia-saudi-ukraine.html"
+    result = validator.rate_url_validity(user_query, test_url)
+    pprint(result)
